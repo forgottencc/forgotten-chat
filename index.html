@@ -39,6 +39,8 @@
       max-width: 85%; padding: 12px 16px; border-radius: 18px;
       line-height: 1.5; word-wrap: break-word; font-size: 15px;
       animation: fadeIn 0.2s;
+      position: relative;
+      user-select: none; /* 防止长按选中文字 */
     }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     .user {
@@ -49,6 +51,31 @@
       align-self: flex-start; background: #533483; color: #f0e6ff;
       border-bottom-left-radius: 4px;
     }
+
+    /* 长按菜单 */
+    .context-menu {
+      position: absolute;
+      background: #2a2a4a;
+      border-radius: 10px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      z-index: 50;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+      min-width: 80px;
+    }
+    .context-menu button {
+      background: none; border: none; color: #e0e0e0;
+      padding: 10px 16px; font-size: 14px; text-align: left;
+      cursor: pointer; white-space: nowrap;
+    }
+    .context-menu button:active {
+      background: #3a3a5c;
+    }
+    .context-menu button + button {
+      border-top: 1px solid #3a3a5c;
+    }
+
     .input-area {
       display: flex; padding: 10px; background: #16213e;
       border-top: 1px solid #3a3a5c; gap: 8px;
@@ -123,6 +150,12 @@
   <!-- 遮罩 -->
   <div class="overlay" id="overlay" onclick="closeSidebar()"></div>
 
+  <!-- 长按菜单（全局唯一） -->
+  <div class="context-menu" id="contextMenu">
+    <button id="menuRevoke">撤回</button>
+    <button id="menuEdit">修改</button>
+  </div>
+
   <!-- 侧边栏 -->
   <div class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -136,7 +169,7 @@
   <div class="header">
     <button class="menu-btn" onclick="openSidebar()">☰</button>
     <div class="title" id="currentChatTitle">DeepSeek 助手</div>
-    <div style="width:40px"></div> <!-- 占位让标题居中 -->
+    <div style="width:40px"></div>
   </div>
 
   <div class="chat-container" id="chatBox">
@@ -150,7 +183,7 @@
 
   <script>
     // ========== 在这里替换你的 API Key ==========
-    const API_KEY = 'sk-28f936060f9e4b44a0ea166df889e86e';
+    const API_KEY = 'YOUR_DEEPSEEK_API_KEY';
     const API_URL = 'https://api.deepseek.com/v1/chat/completions';
     // ===========================================
 
@@ -159,6 +192,15 @@
     const sendBtn = document.getElementById('sendBtn');
     const chatListDiv = document.getElementById('chatList');
     const currentChatTitle = document.getElementById('currentChatTitle');
+    const contextMenu = document.getElementById('contextMenu');
+    const menuRevoke = document.getElementById('menuRevoke');
+    const menuEdit = document.getElementById('menuEdit');
+
+    // 长按相关变量
+    let longPressTimer = null;
+    let longPressTarget = null;      // 当前被长按的消息索引（在 messages 数组中的位置）
+    let longPressMessageDiv = null; // 对应的 DOM 元素
+    let isLongPress = false;
 
     // 对话管理
     let chats = JSON.parse(localStorage.getItem('deepseek_chat_list') || '[]');
@@ -198,23 +240,21 @@
       if (chat) currentChatTitle.textContent = chat.title;
       // 显示消息
       chatBox.innerHTML = '';
-      messages.forEach(msg => {
+      messages.forEach((msg, index) => {
         if (msg.role === 'user' || msg.role === 'assistant') {
-          addMessageToDOM(msg.role, msg.content);
+          addMessageToDOM(msg.role, msg.content, index);
         }
       });
       if (messages.filter(m => m.role !== 'system').length === 0) {
-        addMessageToDOM('assistant', '你好！我是 DeepSeek，有什么可以帮你？');
+        addMessageToDOM('assistant', '你好！我是 DeepSeek，有什么可以帮你？', -1);
       }
     }
 
     function saveCurrentChat() {
       localStorage.setItem('deepseek_chat_' + currentChatId, JSON.stringify(messages));
-      // 更新最后活跃时间及标题（取第一条用户消息作为标题）
       const chatIndex = chats.findIndex(c => c.id === currentChatId);
       if (chatIndex > -1) {
         chats[chatIndex].updatedAt = Date.now();
-        // 自动设置对话标题：取第一条用户消息，截断20字
         const firstUserMsg = messages.find(m => m.role === 'user');
         if (firstUserMsg) {
           const raw = firstUserMsg.content.trim();
@@ -231,7 +271,7 @@
 
     function switchChat(chatId) {
       if (chatId === currentChatId) return;
-      // 保存当前对话
+      hideContextMenu();
       saveCurrentChat();
       currentChatId = chatId;
       localStorage.setItem('deepseek_current_chat', currentChatId);
@@ -266,7 +306,6 @@
         return;
       }
       if (!confirm('确定删除这个对话吗？')) return;
-      // 删除存储
       localStorage.removeItem('deepseek_chat_' + chatId);
       chats = chats.filter(c => c.id !== chatId);
       saveChatsList();
@@ -325,25 +364,173 @@
       document.getElementById('overlay').classList.remove('show');
     }
 
-    function addMessageToDOM(role, content) {
+    // 添加消息到DOM，并给用户消息绑定长按事件
+    function addMessageToDOM(role, content, msgIndex) {
       const msgDiv = document.createElement('div');
       msgDiv.className = `message ${role}`;
       msgDiv.textContent = content;
       chatBox.appendChild(msgDiv);
       chatBox.scrollTop = chatBox.scrollHeight;
+
+      // 只有用户消息才绑定长按事件，且必须有有效的索引
+      if (role === 'user' && msgIndex !== undefined && msgIndex >= 0) {
+        msgDiv.dataset.index = msgIndex;
+        msgDiv.addEventListener('touchstart', handleTouchStart);
+        msgDiv.addEventListener('touchend', handleTouchEnd);
+        msgDiv.addEventListener('touchmove', handleTouchMove);
+        // 鼠标长按备用（方便电脑调试）
+        msgDiv.addEventListener('mousedown', handleMouseDown);
+        msgDiv.addEventListener('mouseup', handleMouseUp);
+        msgDiv.addEventListener('mouseleave', handleMouseLeave);
+      }
       return msgDiv;
+    }
+
+    // 重新渲染当前对话（删除/修改后需要）
+    function rerenderChat() {
+      chatBox.innerHTML = '';
+      messages.forEach((msg, index) => {
+        if (msg.role === 'user' || msg.role === 'assistant') {
+          addMessageToDOM(msg.role, msg.content, index);
+        }
+      });
+      if (messages.filter(m => m.role !== 'system').length === 0) {
+        addMessageToDOM('assistant', '你好！我是 DeepSeek，有什么可以帮你？', -1);
+      }
+    }
+
+    // --- 长按菜单逻辑 ---
+    function showContextMenu(msgDiv, msgIndex) {
+      hideContextMenu();
+      longPressMessageDiv = msgDiv;
+      longPressTarget = msgIndex;
+      const rect = msgDiv.getBoundingClientRect();
+      // 菜单位置：默认在消息上方，偏左
+      contextMenu.style.display = 'flex';
+      contextMenu.style.left = (rect.left + window.scrollX) + 'px';
+      contextMenu.style.top = (rect.top + window.scrollY - 10 - contextMenu.offsetHeight) + 'px';
+      // 防止超出屏幕
+      setTimeout(() => {
+        const menuRect = contextMenu.getBoundingClientRect();
+        if (menuRect.right > window.innerWidth) {
+          contextMenu.style.left = (window.innerWidth - menuRect.width - 10) + 'px';
+        }
+        if (menuRect.top < 0) {
+          contextMenu.style.top = (rect.bottom + window.scrollY + 10) + 'px';
+        }
+      }, 0);
+    }
+
+    function hideContextMenu() {
+      contextMenu.style.display = 'none';
+      longPressTarget = null;
+      longPressMessageDiv = null;
+      isLongPress = false;
+    }
+
+    // 撤回操作：删除该消息及之后的所有消息
+    function revokeMessage() {
+      if (longPressTarget === null) return;
+      const index = longPressTarget;
+      // 从消息数组中移除从 index 开始的所有消息
+      messages.splice(index);
+      saveCurrentChat();
+      hideContextMenu();
+      rerenderChat();
+    }
+
+    // 修改操作：同样删除该消息及之后，但把原内容填入输入框
+    function editMessage() {
+      if (longPressTarget === null) return;
+      const originalContent = messages[longPressTarget].content;
+      const index = longPressTarget;
+      messages.splice(index);
+      saveCurrentChat();
+      hideContextMenu();
+      rerenderChat();
+      userInput.value = originalContent;
+      userInput.focus();
+    }
+
+    menuRevoke.addEventListener('click', revokeMessage);
+    menuEdit.addEventListener('click', editMessage);
+
+    // 点击其他地方关闭菜单
+    document.addEventListener('click', (e) => {
+      if (!contextMenu.contains(e.target)) {
+        hideContextMenu();
+      }
+    });
+    document.addEventListener('touchstart', (e) => {
+      if (contextMenu.style.display === 'flex' && !contextMenu.contains(e.target)) {
+        hideContextMenu();
+      }
+    });
+
+    // 长按事件处理（移动端）
+    function handleTouchStart(e) {
+      const msgDiv = e.currentTarget;
+      const index = parseInt(msgDiv.dataset.index, 10);
+      isLongPress = false;
+      longPressTimer = setTimeout(() => {
+        isLongPress = true;
+        showContextMenu(msgDiv, index);
+      }, 500);
+    }
+
+    function handleTouchEnd(e) {
+      clearTimeout(longPressTimer);
+      if (isLongPress) {
+        e.preventDefault(); // 阻止后续点击事件
+        hideContextMenu();   // 实际上菜单已显示，不隐藏，但取消后续click
+      }
+    }
+
+    function handleTouchMove(e) {
+      // 移动时取消长按
+      clearTimeout(longPressTimer);
+      if (isLongPress) {
+        hideContextMenu();
+      }
+    }
+
+    // 鼠标长按备用
+    function handleMouseDown(e) {
+      const msgDiv = e.currentTarget;
+      const index = parseInt(msgDiv.dataset.index, 10);
+      isLongPress = false;
+      longPressTimer = setTimeout(() => {
+        isLongPress = true;
+        showContextMenu(msgDiv, index);
+      }, 500);
+    }
+
+    function handleMouseUp(e) {
+      clearTimeout(longPressTimer);
+      if (isLongPress) {
+        e.preventDefault();
+        // 不隐藏菜单，等待菜单点击
+      }
+    }
+
+    function handleMouseLeave(e) {
+      clearTimeout(longPressTimer);
+      if (isLongPress) {
+        hideContextMenu();
+      }
     }
 
     async function sendMessage() {
       const userText = userInput.value.trim();
       if (!userText) return;
 
-      addMessageToDOM('user', userText);
+      const msgIndex = messages.length; // 即将添加的位置
+      addMessageToDOM('user', userText, msgIndex);
       userInput.value = '';
       messages.push({ role: 'user', content: userText });
       saveCurrentChat();
 
-      const assistantDiv = addMessageToDOM('assistant', '思考中…');
+      const assistantDiv = addMessageToDOM('assistant', '思考中…', -1);
       const dot = document.createElement('span');
       dot.className = 'loading';
       assistantDiv.appendChild(dot);
